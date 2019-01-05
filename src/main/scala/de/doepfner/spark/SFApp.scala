@@ -1,11 +1,12 @@
 package de.doepfner.spark
 
-import org.apache.spark.ml.classification.{DecisionTreeClassificationModel, DecisionTreeClassifier, RandomForestClassificationModel, RandomForestClassifier}
+import org.apache.spark.ml.classification._
 import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
 import org.apache.spark.ml.feature._
 import org.apache.spark.ml.tuning.{CrossValidator, ParamGridBuilder}
 import org.apache.spark.ml.{Pipeline, PipelineModel, PipelineStage}
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.DoubleType
 
 object SFApp {
@@ -19,11 +20,13 @@ object SFApp {
       .read
       .option("header", "true")
       .csv("data/train.csv")
-      .drop("Dates", "Descript", "Resolution")
-      .drop("Address")
+      .drop("Address", "Descript", "Resolution")
       .withColumnRenamed("Category", "label")
       .withColumn("X", $"X".cast(DoubleType))
       .withColumn("Y", $"Y".cast(DoubleType))
+      .withColumn("hour", hour(to_timestamp($"Dates")))
+      .withColumn("month", month(to_timestamp($"Dates")))
+      .drop("Dates")
 
     inputDf.cache()
 
@@ -33,18 +36,24 @@ object SFApp {
       .setOutputCol("indexedLabel")
       .fit(inputDf)
 
+    println("labelIndexer: " + labelIndexer.labels.length)
+
     val dayOfWeekIndexer = new StringIndexer()
       .setInputCol("DayOfWeek")
       .setOutputCol("indexedDayOfWeek")
       .fit(inputDf)
+
+    println("dayOfWeekIndexer: " + dayOfWeekIndexer.labels.length)
 
     val pdDistrictIndexer = new StringIndexer()
       .setInputCol("PdDistrict")
       .setOutputCol("indexedPdDistrict")
       .fit(inputDf)
 
+    println("pdDistrictIndexer: " + pdDistrictIndexer.labels.length)
+
     val assembler = new VectorAssembler()
-      .setInputCols(Array("indexedDayOfWeek", "indexedDayOfWeek", "indexedPdDistrict", "X", "Y"))
+      .setInputCols(Array("indexedDayOfWeek", "indexedPdDistrict", "X", "Y", "hour", "month"))
       .setOutputCol("features")
 
     // Automatically identify categorical features, and index them.
@@ -102,7 +111,7 @@ object SFApp {
       .addGrid[Array[PipelineStage]](pipeline.stages, Array(pipelineDt, pipelineRf))
       .addGrid(dt.maxDepth, Array(4))
       .addGrid(rf.maxBins, Array(64))
-      .addGrid(rf.maxDepth, Array(5, 10))
+      .addGrid(rf.maxDepth, Array(7, 15))
       .addGrid(rf.numTrees, Array(15, 30))
       .build()
 
@@ -125,7 +134,7 @@ object SFApp {
     val predictions = cvModel.transform(testData)
 
     // Select example rows to display.
-    predictions.select("predictedLabel", "label", "features").show(100)
+    predictions.select("predictedLabel", "label", "features").show(100, false)
 
 
     val accuracy = evaluator.evaluate(predictions)
