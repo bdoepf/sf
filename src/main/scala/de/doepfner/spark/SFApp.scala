@@ -1,15 +1,13 @@
 package de.doepfner.spark
 
 import org.apache.spark.SparkConf
-import org.apache.spark.ml.classification._
 import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
 import org.apache.spark.ml.feature._
 import org.apache.spark.ml.tuning.{CrossValidator, ParamGridBuilder}
 import org.apache.spark.ml.{Pipeline, PipelineModel, PipelineStage}
-import org.apache.spark.sql.{SaveMode, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{DoubleType, IntegerType}
-
+import org.apache.spark.sql.{SaveMode, SparkSession}
 
 
 object SFApp {
@@ -81,14 +79,14 @@ object SFApp {
     //    val idf = new IDF().setInputCol("addressHashed").setOutputCol("addressHashedIdf")
     // END EXAMPLE
 
-/*    val addressIndexer = new StringIndexer()
-      .setInputCol("Address")
-      .setOutputCol("indexedAddress")
-      .fit(inputDf)
+    /*    val addressIndexer = new StringIndexer()
+          .setInputCol("Address")
+          .setOutputCol("indexedAddress")
+          .fit(inputDf)
 
-    println("addressIndexer: " + addressIndexer.labels.length)
-*/
-    val encoderOutputCols = Array(s"${dayOfWeekIndexer.getOutputCol}Vec", s"${pdDistrictIndexer.getOutputCol}Vec", "hourVec", "monthVec"/*, s"${addressIndexer.getOutputCol}Vec}"*/)
+        println("addressIndexer: " + addressIndexer.labels.length)
+    */
+    val encoderOutputCols = Array(s"${dayOfWeekIndexer.getOutputCol}Vec", s"${pdDistrictIndexer.getOutputCol}Vec", "hourVec", "monthVec" /*, s"${addressIndexer.getOutputCol}Vec}"*/)
     val encoder = new OneHotEncoderEstimator()
       .setInputCols(Array(dayOfWeekIndexer.getOutputCol, pdDistrictIndexer.getOutputCol, /*addressIndexer.getOutputCol,*/ "hour", "month"))
       .setOutputCols(encoderOutputCols)
@@ -105,30 +103,59 @@ object SFApp {
       .setInputCols("positionScaled" +: encoderOutputCols)
       .setOutputCol("features")
 
-    val lr = new LogisticRegression()
-      .setMaxIter(100)
-      .setRegParam(0.001)
-      .setElasticNetParam(0.8)
-      .setFamily("multinomial")
-      .setLabelCol("indexedLabel").setFeaturesCol("features")
+    // Following transformers are required for Random Forest
+    val assembler = new VectorAssembler()
+      .setInputCols(Array("indexedDayOfWeek", "indexedPdDistrict", "X", "Y", "hour", "month"))
+      .setOutputCol("remainingFeatures")
 
-    println(lr.explainParams())
+    // Automatically identify categorical features, and index them.
+    val featureIndexer = new VectorIndexer()
+      .setInputCol("remainingFeatures")
+      .setOutputCol("features")
+      .setMaxCategories(40) // features with > distinct values are treated as continuous.
+
+
+    val lr = new LrModel()
+    val lrModel = lr.model()
+    println(lrModel.explainParams())
+    val lrStages: Array[PipelineStage] = Array(
+      labelIndexer,
+      dayOfWeekIndexer,
+      pdDistrictIndexer,
+      encoder,
+      xyAssembler,
+      scaler,
+      finalAssembler,
+      lrModel)
+
+    val rf = new RfModel()
+    val rfModel = rf.model()
+    val pipelineRf: Array[PipelineStage] =
+      Array(
+        labelIndexer,
+        dayOfWeekIndexer,
+        pdDistrictIndexer,
+        assembler,
+        featureIndexer,
+        rfModel)
+
     val pipeline = new Pipeline()
-    val lrStages: Array[PipelineStage] = Array(labelIndexer, dayOfWeekIndexer, pdDistrictIndexer, /*addressIndexer,*/ encoder, xyAssembler, scaler, finalAssembler, lr)
+    val gridBuilder = new ParamGridBuilder()
+      .addGrid[Array[PipelineStage]](pipeline.stages, Array(lrStages, pipelineRf))
 
-    // Model selection
-    val paramGrid = new ParamGridBuilder()
-      .addGrid[Array[PipelineStage]](pipeline.stages, Array(lrStages))
-      .addGrid(lr.maxIter, Array(10))
-      .addGrid(lr.regParam, Array(0.1))
-      .addGrid(lr.elasticNetParam, Array(0.0))
-      .build()
+    // add lr params
+    val withLrParams = lr.addGridParams(gridBuilder)
+
+    // add rf params
+    val withRfParams = rf.addGridParams(withLrParams)
+
+    // hyper params
+    val paramGrid = withRfParams.build()
 
     // Select (prediction, true label) and compute test error.
     val evaluator = new MulticlassClassificationEvaluator()
       .setLabelCol("indexedLabel")
       .setPredictionCol("prediction")
-   //   .setMetricName("accuracy")
     val cv = new CrossValidator()
       .setEstimator(pipeline)
       .setEvaluator(evaluator)
@@ -142,17 +169,9 @@ object SFApp {
     // Make predictions.
     val predictions = cvModel.transform(testData)
 
-    val model = cvModel.bestModel.asInstanceOf[PipelineModel].stages.last.asInstanceOf[LogisticRegressionModel]
-    model.summary.objectiveHistory.foreach(println)
-
-    println(
-      s"""RandomForest classification tree model:
-         | maxIter: ${model.getMaxIter}
-         | regParam: ${model.getRegParam}
-         | elasticNetParam: ${model.getElasticNetParam}""".stripMargin
-    )
-
-    println("Accuracy of summary" + model.summary.accuracy)
+    val bestModel = cvModel.bestModel.asInstanceOf[PipelineModel].stages.last //.asInstanceOf[LogisticRegressionModel]
+    lr.evaluate(bestModel)
+    rf.evaluate(bestModel)
 
     // Convert indexed labels back to original labels.
     val labelConverter = new IndexToString()
@@ -204,11 +223,7 @@ object SFApp {
           .setInputCols(Array("indexedDayOfWeek", "indexedPdDistrict", "X", "Y", "hour", "month"))
           .setOutputCol("remainingFeatures")
 
-        // Automatically identify categorical features, and index them.
-        val featureIndexer = new VectorIndexer()
-          .setInputCol("remainingFeatures")
-          .setOutputCol("remainingIndexedFeatures")
-          .setMaxCategories(40) // features with > distinct values are treated as continuous.
+
 
         val assembler2 = new VectorAssembler()
           .setInputCols(Array("remainingIndexedFeatures", "addressHashedIdf"))
