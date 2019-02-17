@@ -1,6 +1,8 @@
 package de.doepfner.spark
 
+import org.apache.log4j.{Level, Logger}
 import org.apache.spark.SparkConf
+import org.apache.spark.ml.classification.{MultilayerPerceptronClassificationModel, MultilayerPerceptronClassifier}
 import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
 import org.apache.spark.ml.feature._
 import org.apache.spark.ml.tuning.{CrossValidator, ParamGridBuilder}
@@ -9,13 +11,14 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{DoubleType, IntegerType}
 import org.apache.spark.sql.{SaveMode, SparkSession}
 
-
 object SFApp {
 
   def main(args: Array[String]): Unit = {
     implicit val spark: SparkSession = SparkSession.builder().config(new SparkConf().set("spark.local.dir", "/home/user1/spark-tmp")).master("local[*]").getOrCreate()
     import spark.implicits._
     spark.sparkContext.setLogLevel("WARN")
+    val loggerNames = List("org.apache.spark.ml.util.Instrumentation", "org.apache.spark.mllib.optimization.GradientDescent")
+    loggerNames.foreach(lname => Logger.getLogger(lname.stripSuffix("$")).setLevel(Level.INFO))
 
     val inputDf = spark
       .read
@@ -29,6 +32,7 @@ object SFApp {
       .withColumn("month", month(to_timestamp($"Dates")))
       .drop("Dates")
 
+    inputDf.printSchema()
     inputDf.cache()
     // Split the data into training and test sets (30% held out for testing).
     val Array(trainingData, testData) = inputDf.randomSplit(Array(0.9, 0.1))
@@ -115,10 +119,53 @@ object SFApp {
       .setMaxCategories(40) // features with > distinct values are treated as continuous.
 
 
-    val lr = new LrModel()
-    val lrModel = lr.model()
-    println(lrModel.explainParams())
-    val lrStages: Array[PipelineStage] = Array(
+    //    val lr = new LrModel()
+    //    val lrModel = lr.model()
+    //    println(lrModel.explainParams())
+    //    val lrStages: Array[PipelineStage] = Array(
+    //      labelIndexer,
+    //      dayOfWeekIndexer,
+    //      pdDistrictIndexer,
+    //      encoder,
+    //      xyAssembler,
+    //      scaler,
+    //      finalAssembler,
+    //      lrModel)
+
+    //    val rf = new RfModel()
+    //    val rfModel = rf.model()
+    //    val pipelineRf: Array[PipelineStage] =
+    //      Array(
+    //        labelIndexer,
+    //        dayOfWeekIndexer,
+    //        pdDistrictIndexer,
+    //        assembler,
+    //        featureIndexer,
+    //        rfModel)
+
+
+    val mpcPrepStages: Array[PipelineStage] = Array(
+      labelIndexer,
+      dayOfWeekIndexer,
+      pdDistrictIndexer,
+      encoder,
+      xyAssembler,
+      scaler,
+      finalAssembler)
+    val model = new Pipeline().setStages(mpcPrepStages).fit(inputDf).transform(inputDf)
+    val numOfinputFeatures = model.schema("features").metadata.getMetadata("ml_attr").getLong("num_attrs")
+    print("NumberOfInputFeatures :" + numOfinputFeatures)
+    val mpc = new MultilayerPerceptronClassifier()
+      .setLabelCol("indexedLabel")
+      .setFeaturesCol("features")
+      .setLayers(Array[Int](numOfinputFeatures.toInt, 5, 10, 20, 39))
+      .setBlockSize(128)
+      .setSeed(1234L)
+      .setMaxIter(500)
+      .setSolver("gd")
+
+    mpc.explainParams()
+    val mpcStages: Array[PipelineStage] = Array(
       labelIndexer,
       dayOfWeekIndexer,
       pdDistrictIndexer,
@@ -126,31 +173,20 @@ object SFApp {
       xyAssembler,
       scaler,
       finalAssembler,
-      lrModel)
-
-    val rf = new RfModel()
-    val rfModel = rf.model()
-    val pipelineRf: Array[PipelineStage] =
-      Array(
-        labelIndexer,
-        dayOfWeekIndexer,
-        pdDistrictIndexer,
-        assembler,
-        featureIndexer,
-        rfModel)
+      mpc)
 
     val pipeline = new Pipeline()
     val gridBuilder = new ParamGridBuilder()
-      .addGrid[Array[PipelineStage]](pipeline.stages, Array(lrStages, pipelineRf))
+      .addGrid[Array[PipelineStage]](pipeline.stages, Array(/*lrStages, pipelineRf */ mpcStages))
 
     // add lr params
-    val withLrParams = lr.addGridParams(gridBuilder)
+    //    val withLrParams = lr.addGridParams(gridBuilder)
 
     // add rf params
-    val withRfParams = rf.addGridParams(withLrParams)
+    //    val withRfParams = rf.addGridParams(withLrParams)
 
     // hyper params
-    val paramGrid = withRfParams.build()
+    val paramGrid = gridBuilder.build()
 
     // Select (prediction, true label) and compute test error.
     val evaluator = new MulticlassClassificationEvaluator()
@@ -165,13 +201,14 @@ object SFApp {
 
     // Train model. This also runs the indexers.
     val cvModel = cv.fit(trainingData)
-
     // Make predictions.
     val predictions = cvModel.transform(testData)
 
-    val bestModel = cvModel.bestModel.asInstanceOf[PipelineModel].stages.last //.asInstanceOf[LogisticRegressionModel]
-    lr.evaluate(bestModel)
-    rf.evaluate(bestModel)
+    val bestModel = cvModel.bestModel.asInstanceOf[PipelineModel].stages.last.asInstanceOf[MultilayerPerceptronClassificationModel]
+    bestModel.save(s"model/MultilayerPerceptron_${System.currentTimeMillis()}")
+
+    //    lr.evaluate(bestModel)
+    //    rf.evaluate(bestModel)
 
     // Convert indexed labels back to original labels.
     val labelConverter = new IndexToString()
@@ -185,7 +222,6 @@ object SFApp {
     val accuracy = evaluator.evaluate(predictions)
     println(s"Test Error = ${1.0 - accuracy}")
 
-    // TODO REFACTORING SUBMISSION
     // SUBMISSION Id,Dates,DayOfWeek,PdDistrict,Address,X,Y
     val testDf = spark
       .read
@@ -199,144 +235,46 @@ object SFApp {
       .drop("Dates", "Address")
 
     val testPredictions = cvModel.transform(testDf)
-    val testPredictionsRelabled = labelConverter.transform(testPredictions).select("Id", "predictedLabel")
-    testPredictionsRelabled.show(100, false)
-    val resultDf = testPredictionsRelabled
-      .as[ResultItem]
-      .map(Result.convertToSubmission)
 
-    resultDf.cache()
-    val count = resultDf.count()
-    println("Count: " + count)
-    assert(count == 884262)
-    resultDf
-      .repartition(1)
+    // The column containing probabilities has to be converted from Vector to Array
+    val vecToArray = udf((xs: org.apache.spark.ml.linalg.Vector) => xs.toArray)
+    val dfArr = testPredictions.withColumn("probabilityArr", vecToArray($"probability"))
+
+    val probColumns = labelIndexer.labels.zipWithIndex.map {
+      case (alias, idx) => (alias, col("probabilityArr").getItem(idx).as(alias))
+    }
+
+    val columnsAdded = probColumns.foldLeft(dfArr) { case (d, (colName, colContents)) =>
+      if (d.columns.contains(colName)) {
+        d
+      } else {
+        d.withColumn(colName, colContents)
+      }
+    }
+    val resultDf = columnsAdded.select("id", labelIndexer.labels.toList: _*)
+    resultDf.show()
+    resultDf.repartition(1)
       .write
       .mode(SaveMode.Overwrite)
       .option("header", true)
       .option("compression", "gzip")
       .csv("data/submission/")
-
-
-    /*
-        val assembler = new VectorAssembler()
-          .setInputCols(Array("indexedDayOfWeek", "indexedPdDistrict", "X", "Y", "hour", "month"))
-          .setOutputCol("remainingFeatures")
-
-
-
-        val assembler2 = new VectorAssembler()
-          .setInputCols(Array("remainingIndexedFeatures", "addressHashedIdf"))
-          .setOutputCol("indexedFeatures")
-        // .fit(data)
-
-
-
-        // Train a DecisionTree model.
-        val dt = new DecisionTreeClassifier()
-          .setLabelCol("indexedLabel")
-          .setFeaturesCol("indexedFeatures")
-
-        // Train a RandomForest model.
-        val rf = new RandomForestClassifier()
-          .setLabelCol("indexedLabel")
-          .setFeaturesCol("indexedFeatures")
-
-        // Convert indexed labels back to original labels.
-        val labelConverter = new IndexToString()
-          .setInputCol("prediction")
-          .setOutputCol("predictedLabel")
-          .setLabels(labelIndexer.labels)
-
-        val pipeline = new Pipeline()
-
-          // Chain indexers and tree in a Pipeline.
-          val pipelineDt: Array[PipelineStage] =
-            Array(
-              labelIndexer,
-              dayOfWeekIndexer,
-              pdDistrictIndexer,
-              tokenizer,
-              remover,
-              hashingTF,
-              idf,
-              assembler,
-              featureIndexer,
-              assembler2,
-              dt,
-              labelConverter)
-
-          val pipelineRf: Array[PipelineStage] =
-            Array(
-              labelIndexer,
-              dayOfWeekIndexer,
-              pdDistrictIndexer,
-              tokenizer,
-              remover,
-              hashingTF,
-              idf,
-              assembler,
-              featureIndexer,
-              assembler2,
-              rf,
-              labelConverter)
-
-
-          // Model selection
-          val paramGrid = new ParamGridBuilder()
-            .addGrid[Array[PipelineStage]](pipeline.stages, Array(pipelineDt, pipelineRf))
-            .addGrid(dt.maxDepth, Array(4))
-            .addGrid(rf.maxBins, Array(32))
-            .addGrid(rf.maxDepth, Array(15))
-            .addGrid(rf.numTrees, Array(30))
-            .build()
-
-          // Select (prediction, true label) and compute test error.
-          val evaluator = new MulticlassClassificationEvaluator()
-            .setLabelCol("indexedLabel")
-            .setPredictionCol("prediction")
-            .setMetricName("accuracy")
-          val cv = new CrossValidator()
-            .setEstimator(pipeline)
-            .setEvaluator(evaluator)
-            .setEstimatorParamMaps(paramGrid)
-            .setNumFolds(3) // Use 3+ in practice
-            .setParallelism(5) // Evaluate up to 2 parameter settings in parallel
-
-          // Train model. This also runs the indexers.
-          val cvModel = cv.fit(trainingData)
-
-          // Make predictions.
-          val predictions = cvModel.transform(testData)
-
-          // Select example rows to display.
-          predictions.select("predictedLabel", "label").show(100, false)
-
-
-          val accuracy = evaluator.evaluate(predictions)
-          println(s"Test Error = ${1.0 - accuracy}")
-
-          println(s"Cross validation:")
-          cvModel.avgMetrics.foreach(x => println(s"\t$x"))
-
-          val bestModel = cvModel
-            .bestModel
-            .asInstanceOf[PipelineModel]
-            .stages(5)
-
-          bestModel match {
-            case model: DecisionTreeClassificationModel =>
-              println(s"DecisionTree classification tree model: $model")
-
-            case model: RandomForestClassificationModel =>
-              println(
-                s"""RandomForest classification tree model:
-                   | numTrees: ${model.getNumTrees}
-                   | totalNumNodes: ${model.totalNumNodes}
-                   | maxDepth: ${model.getMaxDepth}
-                   | maxBins: ${model.getMaxBins}""".stripMargin
-              )
-          }
-      */
+    //    val testPredictionsRelabled = labelConverter.transform(testPredictions).select("Id", "predictedLabel")
+    //    testPredictionsRelabled.show(100, false)
+    //    val resultDf = testPredictionsRelabled
+    //      .as[ResultItem]
+    //      .map(Result.convertToSubmission)
+    //
+    //    resultDf.cache()
+    //    val count = resultDf.count()
+    //    println("Count: " + count)
+    //    assert(count == 884262)
+    //    resultDf
+    //      .repartition(1)
+    //      .write
+    //      .mode(SaveMode.Overwrite)
+    //      .option("header", true)
+    //      .option("compression", "gzip")
+    //      .csv("data/submission/")
   }
 }
