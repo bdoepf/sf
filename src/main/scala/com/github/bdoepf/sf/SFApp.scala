@@ -1,24 +1,29 @@
-package de.doepfner.spark
+package com.github.bdoepf.sf
 
 import org.apache.log4j.{Level, Logger}
 import org.apache.spark.SparkConf
-import org.apache.spark.ml.classification.{MultilayerPerceptronClassificationModel, MultilayerPerceptronClassifier}
 import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
 import org.apache.spark.ml.feature._
 import org.apache.spark.ml.tuning.{CrossValidator, ParamGridBuilder}
-import org.apache.spark.ml.{Pipeline, PipelineModel, PipelineStage}
+import org.apache.spark.ml.{Pipeline, PipelineModel, PipelineStage, linalg}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{DoubleType, IntegerType}
 import org.apache.spark.sql.{SaveMode, SparkSession}
+import org.slf4j.LoggerFactory
 
 object SFApp {
 
   def main(args: Array[String]): Unit = {
-    implicit val spark: SparkSession = SparkSession.builder().config(new SparkConf().set("spark.local.dir", "/home/user1/spark-tmp")).master("local[*]").getOrCreate()
+    val log = LoggerFactory.getLogger(this.getClass.getName.stripSuffix("$"))
+    setLogLevels()
+
+    implicit val spark: SparkSession = SparkSession
+      .builder()
+      .config(new SparkConf()
+        .set("spark.local.dir", s"${sys.env("HOME")}/spark-tmp"))
+      .master("local[*]")
+      .getOrCreate()
     import spark.implicits._
-    spark.sparkContext.setLogLevel("WARN")
-    val loggerNames = List("org.apache.spark.ml.util.Instrumentation", "org.apache.spark.mllib.optimization.GradientDescent")
-    loggerNames.foreach(lname => Logger.getLogger(lname.stripSuffix("$")).setLevel(Level.INFO))
 
     val inputDf = spark
       .read
@@ -31,10 +36,11 @@ object SFApp {
       .withColumn("hour", hour(to_timestamp($"Dates")))
       .withColumn("month", month(to_timestamp($"Dates")))
       .drop("Dates")
+    // .sample(0.01) // for testing take only a fraction of all input data
 
     inputDf.printSchema()
     inputDf.cache()
-    // Split the data into training and test sets (30% held out for testing).
+    // Split the data into training and test sets
     val Array(trainingData, testData) = inputDf.randomSplit(Array(0.9, 0.1))
 
     // Label, crime categories
@@ -43,53 +49,23 @@ object SFApp {
       .setOutputCol("indexedLabel")
       .fit(inputDf)
 
-    println("labelIndexer: " + labelIndexer.labels.length)
+    val numberOfCrimeCategories = labelIndexer.labels.length
+    log.info("labelIndexer: " + numberOfCrimeCategories)
 
     val dayOfWeekIndexer = new StringIndexer()
       .setInputCol("DayOfWeek")
       .setOutputCol("indexedDayOfWeek")
       .fit(inputDf)
 
-    println("dayOfWeekIndexer: " + dayOfWeekIndexer.labels.length)
+    log.info("dayOfWeekIndexer: " + dayOfWeekIndexer.labels.length)
 
     val pdDistrictIndexer = new StringIndexer()
       .setInputCol("PdDistrict")
       .setOutputCol("indexedPdDistrict")
       .fit(inputDf)
 
-    println("pdDistrictIndexer: " + pdDistrictIndexer.labels.length)
+    log.info("pdDistrictIndexer: " + pdDistrictIndexer.labels.length)
 
-
-    // START EXAMPLE
-
-    //    val sentenceData = spark.createDataFrame(Seq(
-    //      (0.0, "Hi I heard about Spark"),
-    //      (0.0, "I wish Java could use case classes"),
-    //      (1.0, "Logistic regression models are neat")
-    //    )).toDF("label", "sentence")
-
-    //    val tokenizer = new Tokenizer().setInputCol("Address").setOutputCol("addressTokenized")
-    //
-    //    val remover = new StopWordsRemover()
-    //      .setInputCol("addressTokenized")
-    //      .setOutputCol("addressTokenizedFiltered")
-
-    //    remover.transform(tokenizer.transform(inputDf)).show(100, false)
-    //    sys.exit(0)
-
-    //    val hashingTF = new HashingTF()
-    //      .setInputCol("addressTokenizedFiltered").setOutputCol("addressHashed").setNumFeatures(5000)
-    //
-    //    val idf = new IDF().setInputCol("addressHashed").setOutputCol("addressHashedIdf")
-    // END EXAMPLE
-
-    /*    val addressIndexer = new StringIndexer()
-          .setInputCol("Address")
-          .setOutputCol("indexedAddress")
-          .fit(inputDf)
-
-        println("addressIndexer: " + addressIndexer.labels.length)
-    */
     val encoderOutputCols = Array(s"${dayOfWeekIndexer.getOutputCol}Vec", s"${pdDistrictIndexer.getOutputCol}Vec", "hourVec", "monthVec" /*, s"${addressIndexer.getOutputCol}Vec}"*/)
     val encoder = new OneHotEncoderEstimator()
       .setInputCols(Array(dayOfWeekIndexer.getOutputCol, pdDistrictIndexer.getOutputCol, /*addressIndexer.getOutputCol,*/ "hour", "month"))
@@ -121,7 +97,7 @@ object SFApp {
 
     //    val lr = new LrModel()
     //    val lrModel = lr.model()
-    //    println(lrModel.explainParams())
+    //    log.info(lrModel.explainParams())
     //    val lrStages: Array[PipelineStage] = Array(
     //      labelIndexer,
     //      dayOfWeekIndexer,
@@ -132,18 +108,20 @@ object SFApp {
     //      finalAssembler,
     //      lrModel)
 
-    //    val rf = new RfModel()
-    //    val rfModel = rf.model()
-    //    val pipelineRf: Array[PipelineStage] =
-    //      Array(
-    //        labelIndexer,
-    //        dayOfWeekIndexer,
-    //        pdDistrictIndexer,
-    //        assembler,
-    //        featureIndexer,
-    //        rfModel)
+    // Random Forest
+    val rf = new RfModel()
+    val rfModel = rf.model()
+    val pipelineRf: Array[PipelineStage] =
+      Array(
+        labelIndexer,
+        dayOfWeekIndexer,
+        pdDistrictIndexer,
+        assembler,
+        featureIndexer,
+        rfModel)
 
 
+    // MultilayerPerceptron
     val mpcPrepStages: Array[PipelineStage] = Array(
       labelIndexer,
       dayOfWeekIndexer,
@@ -154,17 +132,10 @@ object SFApp {
       finalAssembler)
     val model = new Pipeline().setStages(mpcPrepStages).fit(inputDf).transform(inputDf)
     val numOfinputFeatures = model.schema("features").metadata.getMetadata("ml_attr").getLong("num_attrs")
-    print("NumberOfInputFeatures :" + numOfinputFeatures)
-    val mpc = new MultilayerPerceptronClassifier()
-      .setLabelCol("indexedLabel")
-      .setFeaturesCol("features")
-      .setLayers(Array[Int](numOfinputFeatures.toInt, 5, 10, 20, 39))
-      .setBlockSize(128)
-      .setSeed(1234L)
-      .setMaxIter(500)
-      .setSolver("gd")
-
-    mpc.explainParams()
+    log.info("NumberOfInputFeatures :" + numOfinputFeatures)
+    val mlp = new MLPModel(numOfinputFeatures.toInt, numberOfCrimeCategories)
+    val mlpModel = mlp.model()
+    mlpModel.explainParams()
     val mpcStages: Array[PipelineStage] = Array(
       labelIndexer,
       dayOfWeekIndexer,
@@ -173,20 +144,18 @@ object SFApp {
       xyAssembler,
       scaler,
       finalAssembler,
-      mpc)
+      mlpModel)
 
+    // ML Pipeline
+    val models = List(rf, mlp)
     val pipeline = new Pipeline()
-    val gridBuilder = new ParamGridBuilder()
-      .addGrid[Array[PipelineStage]](pipeline.stages, Array(/*lrStages, pipelineRf */ mpcStages))
+    val baseGridBuilder = new ParamGridBuilder()
+      .addGrid[Array[PipelineStage]](pipeline.stages, Array(/*lrStages, */ pipelineRf, mpcStages))
 
-    // add lr params
-    //    val withLrParams = lr.addGridParams(gridBuilder)
-
-    // add rf params
-    //    val withRfParams = rf.addGridParams(withLrParams)
-
-    // hyper params
-    val paramGrid = gridBuilder.build()
+    // add hyper params for tuning
+    val paramGrid = models
+      .foldLeft(baseGridBuilder)((grid: ParamGridBuilder, model: SfModel) => model.addGridParams(grid))
+      .build
 
     // Select (prediction, true label) and compute test error.
     val evaluator = new MulticlassClassificationEvaluator()
@@ -197,18 +166,16 @@ object SFApp {
       .setEvaluator(evaluator)
       .setEstimatorParamMaps(paramGrid)
       .setNumFolds(3) // Use 3+ in practice
-      .setParallelism(5) // Evaluate up to 2 parameter settings in parallel
+      .setParallelism(5) // Evaluate in parallel
 
-    // Train model. This also runs the indexers.
+    // Train model. This also runs the indexers
     val cvModel = cv.fit(trainingData)
-    // Make predictions.
+    // Make predictions
     val predictions = cvModel.transform(testData)
 
-    val bestModel = cvModel.bestModel.asInstanceOf[PipelineModel].stages.last.asInstanceOf[MultilayerPerceptronClassificationModel]
-    bestModel.save(s"model/MultilayerPerceptron_${System.currentTimeMillis()}")
-
-    //    lr.evaluate(bestModel)
-    //    rf.evaluate(bestModel)
+    // Check which model was the best and save it
+    val bestModel = cvModel.bestModel.asInstanceOf[PipelineModel].stages.last
+    models.foreach(m => m.evaluate(bestModel))
 
     // Convert indexed labels back to original labels.
     val labelConverter = new IndexToString()
@@ -217,10 +184,10 @@ object SFApp {
       .setLabels(labelIndexer.labels)
 
     // Select example rows to display.
-    labelConverter.transform(predictions).select("predictedLabel", "label").show(100, false)
+    labelConverter.transform(predictions).select("predictedLabel", "label").show(100, truncate = false)
 
     val accuracy = evaluator.evaluate(predictions)
-    println(s"Test Error = ${1.0 - accuracy}")
+    log.info(s"Test Error = ${1.0 - accuracy}")
 
     // SUBMISSION Id,Dates,DayOfWeek,PdDistrict,Address,X,Y
     val testDf = spark
@@ -237,7 +204,7 @@ object SFApp {
     val testPredictions = cvModel.transform(testDf)
 
     // The column containing probabilities has to be converted from Vector to Array
-    val vecToArray = udf((xs: org.apache.spark.ml.linalg.Vector) => xs.toArray)
+    val vecToArray = udf((xs: linalg.Vector) => xs.toArray)
     val dfArr = testPredictions.withColumn("probabilityArr", vecToArray($"probability"))
 
     val probColumns = labelIndexer.labels.zipWithIndex.map {
@@ -256,25 +223,16 @@ object SFApp {
     resultDf.repartition(1)
       .write
       .mode(SaveMode.Overwrite)
-      .option("header", true)
+      .option("header", value = true)
       .option("compression", "gzip")
       .csv("data/submission/")
-    //    val testPredictionsRelabled = labelConverter.transform(testPredictions).select("Id", "predictedLabel")
-    //    testPredictionsRelabled.show(100, false)
-    //    val resultDf = testPredictionsRelabled
-    //      .as[ResultItem]
-    //      .map(Result.convertToSubmission)
-    //
-    //    resultDf.cache()
-    //    val count = resultDf.count()
-    //    println("Count: " + count)
-    //    assert(count == 884262)
-    //    resultDf
-    //      .repartition(1)
-    //      .write
-    //      .mode(SaveMode.Overwrite)
-    //      .option("header", true)
-    //      .option("compression", "gzip")
-    //      .csv("data/submission/")
+  }
+
+  private def setLogLevels(): Unit = {
+    Logger.getRootLogger.setLevel(Level.WARN)
+    Logger.getLogger("org.apache.spark").setLevel(Level.WARN)
+    Logger.getLogger("com.github.bdoepf.sf").setLevel(Level.INFO)
+    val interestingSparkLoggers = List("org.apache.spark.ml.util.Instrumentation", "org.apache.spark.mllib.optimization.GradientDescent")
+    interestingSparkLoggers.foreach(logName => Logger.getLogger(logName.stripSuffix("$")).setLevel(Level.INFO))
   }
 }

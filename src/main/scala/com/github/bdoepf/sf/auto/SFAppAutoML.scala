@@ -1,4 +1,4 @@
-package de.doepfner.spark
+package com.github.bdoepf.sf.auto
 
 import com.salesforce.op.{OpParams, OpWorkflow, OpWorkflowRunner}
 import com.salesforce.op.evaluators.Evaluators
